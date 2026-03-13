@@ -1,5 +1,4 @@
 name: 构建SRPatch-X APK
-
 on:
   push:
     branches: [ "main", "master" ]
@@ -14,6 +13,13 @@ jobs:
     name: 构建Android APK
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: write
+      actions: read
+    env:
+      TARGET_DIR: ${{ github.workspace }}/app
+      KEYSTORE_PATH: ${{ github.workspace }}/app/keystore.jks
+      PROPS_PATH: ${{ github.workspace }}/app/signing.properties
 
     steps:
       - name: 检出项目代码
@@ -28,92 +34,97 @@ jobs:
 
       - name: 配置Android SDK环境
         uses: android-actions/setup-android@v3
+        with:
+          accept-licenses: true
 
-      - name: 添加Gradle执行权限
-        run: chmod +x ./gradlew
+      - name: 配置Gradle执行权限
+        run: |
+          set -euo pipefail
+          if [ ! -f "./gradlew" ]; then
+            echo "❌ 错误：gradlew文件不存在，请检查项目根目录结构"
+            exit 1
+          fi
+          chmod +x ./gradlew
+          echo "✅ Gradle执行权限配置完成"
 
-      # 签名配置：自动适配项目路径，全场景容错
-      - name: 生成签名配置与密钥文件（自适应路径）
+      - name: 生成签名配置与密钥文件
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
-          # 1. 生成 keystore.jks 到项目根目录，同时校验必填参数
+          set -euo pipefail
+
+          if [ ! -d "$TARGET_DIR" ]; then
+            echo "❌ 错误：app目录不存在，请检查项目结构"
+            exit 1
+          fi
+
           if [ -n "$KEYSTORE_BASE64" ]; then
-            echo "✅ 使用自定义签名密钥"
-            # 校验自定义签名的必填参数是否完整
+            echo "✅ 检测到自定义签名密钥，开始配置"
             if [ -z "$KEYSTORE_PASSWORD" ] || [ -z "$KEY_ALIAS" ] || [ -z "$KEY_PASSWORD" ]; then
               echo "❌ 自定义签名配置不完整：KEYSTORE_PASSWORD/KEY_ALIAS/KEY_PASSWORD 不能为空"
               exit 1
             fi
-            # 解码签名文件
-            echo "$KEYSTORE_BASE64" | base64 --decode > keystore.jks
-            if [ ! -f keystore.jks ]; then
-              echo "❌ 签名文件解码失败，请检查KEYSTORE_BASE64是否正确"
+            printf "%s" "$KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE_PATH"
+            if [ ! -s "$KEYSTORE_PATH" ]; then
+              echo "❌ 签名文件解码失败：文件为空，请检查KEYSTORE_BASE64是否正确"
               exit 1
             fi
             STORE_PASS="$KEYSTORE_PASSWORD"
-            KEY_ALIAS="$KEY_ALIAS"
-            KEY_PASS="$KEY_PASSWORD"
+            FINAL_KEY_ALIAS="$KEY_ALIAS"
+            FINAL_KEY_PASS="$KEY_PASSWORD"
           else
             echo "⚠️ 未配置自定义签名，自动生成临时调试密钥"
-            # 一键生成调试密钥，无人工交互
-            keytool -genkey -v \
-              -keystore keystore.jks \
-              -keyalg RSA -keysize 2048 -validity 10000 \
-              -alias debug \
-              -storepass debug123 -keypass debug123 \
-              -dname "CN=Debug, OU=Debug, O=Debug, L=Debug, S=Debug, C=US" \
-              -noprompt
+            keytool -genkey -v -keystore "$KEYSTORE_PATH" -keyalg RSA -keysize 2048 -validity 10000 -alias debug -storepass debug123 -keypass debug123 -dname "CN=SRPatch-Debug, OU=SRPatch, O=SRPatch, L=CN, S=CN, C=CN" -noprompt
             STORE_PASS="debug123"
-            KEY_ALIAS="debug"
-            KEY_PASS="debug123"
+            FINAL_KEY_ALIAS="debug"
+            FINAL_KEY_PASS="debug123"
           fi
 
-          # 2. 定位 signing.properties 目标目录，限制搜索范围避免误匹配
-          # 优先在当前目录和app目录查找示例文件，最多递归2级，避免扫描无关目录
-          EXAMPLE_PATH=$(find . -maxdepth 2 -name "signing.properties.example" -print -quit)
-          if [ -n "$EXAMPLE_PATH" ]; then
-            TARGET_DIR=$(dirname "$EXAMPLE_PATH")
-            echo "✅ 找到示例配置文件：$EXAMPLE_PATH，签名配置将生成到 $TARGET_DIR 目录"
-          else
-            # 未找到示例文件，优先使用app目录（Android项目默认惯例）
-            TARGET_DIR="app"
-            echo "⚠️ 未找到 signing.properties.example，默认使用 app 目录作为目标路径"
+          chmod 600 "$KEYSTORE_PATH"
+
+          # 彻底干掉Here Document标红重灾区，用printf直接生成文件，无任何EOF缩进问题
+          printf "storeFile=keystore.jks\nstorePassword=%s\nkeyAlias=%s\nkeyPassword=%s\n" "$STORE_PASS" "$FINAL_KEY_ALIAS" "$FINAL_KEY_PASS" > "$PROPS_PATH"
+
+          chmod 600 "$PROPS_PATH"
+
+          echo "✅ 签名文件生成完成，路径：$KEYSTORE_PATH"
+          echo "✅ 签名配置生成完成，路径：$PROPS_PATH"
+          echo "===== 配置文件预览 ====="
+          sed 's/\(storePassword=\).*/\1******/; s/\(keyPassword=\).*/\1******/' "$PROPS_PATH"
+          echo "=========================="
+
+          echo "🔍 正在验证签名文件有效性..."
+          if ! keytool -list -keystore "$KEYSTORE_PATH" -alias "$FINAL_KEY_ALIAS" -storepass "$STORE_PASS" -keypass "$FINAL_KEY_PASS" > /dev/null 2>&1; then
+            echo "❌ 签名验证失败：密码或别名错误，请检查Secrets配置"
+            exit 1
           fi
-
-          # 3. 计算 keystore.jks 相对于目标目录的相对路径，兼容多级目录
-          # 切换到目标目录，计算到根目录keystore.jks的相对路径，兼容性拉满
-          RELATIVE_PATH=""
-          CURRENT_DIR="$TARGET_DIR"
-          while [ "$CURRENT_DIR" != "." ] && [ "$CURRENT_DIR" != "/" ]; do
-            RELATIVE_PATH="../$RELATIVE_PATH"
-            CURRENT_DIR=$(dirname "$CURRENT_DIR")
-          done
-          STORE_FILE_PATH="${RELATIVE_PATH}keystore.jks"
-          echo "✅ 计算得到 keystore.jks 相对路径：$STORE_FILE_PATH"
-
-          # 4. 生成 signing.properties 配置文件，确保目录存在
-          mkdir -p "$TARGET_DIR"
-          cat > "$TARGET_DIR/signing.properties" <<-EOF
-          storeFile=$STORE_FILE_PATH
-          storePassword=$STORE_PASS
-          keyAlias=$KEY_ALIAS
-          keyPassword=$KEY_PASS
-          EOF
-          
-          echo "✅ signing.properties 已成功生成到 $TARGET_DIR/signing.properties"
-          # 预览配置（隐藏敏感密码信息）
-          echo "配置文件预览："
-          sed 's/\(storePassword=\).*/\1******/; s/\(keyPassword=\).*/\1******/' "$TARGET_DIR/signing.properties"
+          echo "✅ 签名文件验证通过，可正常用于构建"
 
       - name: 构建Release APK
-        run: ./gradlew clean assembleRelease --stacktrace
+        run: |
+          set -euo pipefail
+          ./gradlew clean assembleRelease --stacktrace --no-daemon -Dorg.gradle.parallel=true
+          echo "✅ Release APK构建完成"
+
+      - name: 重命名Release APK
+        if: ${{ github.event_name == 'release' && github.event.action == 'published' }}
+        run: |
+          set -euo pipefail
+          APK_FILE=$(find "$TARGET_DIR/build/outputs/apk/release" -name "*.apk" | head -n 1)
+          if [ ! -f "$APK_FILE" ]; then
+            echo "❌ 错误：未找到构建完成的APK文件"
+            exit 1
+          fi
+          NEW_APK_NAME="SRPatch-X-${{ github.ref_name }}-release.apk"
+          mv "$APK_FILE" "$TARGET_DIR/build/outputs/apk/release/$NEW_APK_NAME"
+          echo "✅ APK重命名完成：$NEW_APK_NAME"
 
       - name: 上传APK构建产物
         uses: actions/upload-artifact@v4
+        if: ${{ success() }}
         with:
           name: SRPatch-X-Release-APK
           path: app/build/outputs/apk/release/*.apk
@@ -125,3 +136,9 @@ jobs:
         with:
           files: app/build/outputs/apk/release/*.apk
           fail_on_unmatched_files: true
+
+      - name: 强制清理敏感签名文件
+        if: ${{ always() }}
+        run: |
+          rm -f "$KEYSTORE_PATH" "$PROPS_PATH"
+          echo "✅ 敏感签名文件已清理完成"

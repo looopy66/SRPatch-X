@@ -23,7 +23,7 @@ jobs:
       - name: 检出项目代码
         uses: actions/checkout@v4
 
-      # 步骤2：配置JDK环境（适配项目Android Gradle Plugin要求）
+      # 步骤2：配置JDK环境（适配项目Android Gradle Plugin要求，自带keytool工具）
       - name: 配置JDK 17
         uses: actions/setup-java@v4
         with:
@@ -39,37 +39,53 @@ jobs:
       - name: 添加Gradle执行权限
         run: chmod +x ./gradlew
 
-      # 步骤5：APK签名配置（自动判断是否配置签名密钥，无配置自动跳过，绝不报错）
-      - name: 准备APK签名配置
+      # 步骤5：核心修复 - 全场景兼容签名配置，永远不会缺失signing.properties文件
+      - name: 生成签名配置与密钥文件
         env:
-          # 签名密钥全部通过环境变量传递，兼容有无配置两种场景
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
-          # 核心逻辑：Shell判断是否配置了签名密钥，无配置直接跳过，有配置才执行签名文件生成
-          if [ -z "$KEYSTORE_BASE64" ]; then
-            echo "⚠️ 未配置签名Secrets，跳过APK签名配置，将构建未签名APK"
-            exit 0
+          # 优先使用用户配置的自定义签名密钥
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "✅ 检测到自定义签名配置，使用用户提供的密钥文件"
+            # 解码base64编码的签名文件
+            echo "$KEYSTORE_BASE64" | base64 --decode > keystore.jks
+            # 验证签名文件解码是否成功
+            if [ ! -f keystore.jks ]; then
+              echo "❌ 签名文件解码失败，请检查KEYSTORE_BASE64是否正确"
+              exit 1
+            fi
+            # 生成适配项目的signing.properties配置文件
+            echo "storeFile=../keystore.jks" > app/signing.properties
+            echo "storePassword=$KEYSTORE_PASSWORD" >> app/signing.properties
+            echo "keyAlias=$KEY_ALIAS" >> app/signing.properties
+            echo "keyPassword=$KEY_PASSWORD" >> app/signing.properties
+            echo "✅ 自定义签名配置生成完成"
+          else
+            # 未配置自定义签名，自动生成临时调试签名密钥，保证构建不报错
+            echo "⚠️ 未配置自定义签名Secrets，自动生成临时调试签名密钥"
+            # 一键生成调试用keystore文件，无需人工交互
+            keytool -genkey -v \
+              -keystore keystore.jks \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -alias debug \
+              -storepass debug123 \
+              -keypass debug123 \
+              -dname "CN=Debug, OU=Debug, O=Debug, L=Debug, S=Debug, C=US" \
+              -noprompt
+            # 生成对应调试签名的signing.properties配置文件，完全匹配项目要求
+            echo "storeFile=../keystore.jks" > app/signing.properties
+            echo "storePassword=debug123" >> app/signing.properties
+            echo "keyAlias=debug" >> app/signing.properties
+            echo "keyPassword=debug123" >> app/signing.properties
+            echo "✅ 临时调试签名配置生成完成，可正常构建APK"
           fi
 
-          echo "✅ 检测到签名配置，开始生成签名文件与配置"
-          # 1. 将base64编码的签名文件解码为jks格式，放在项目根目录
-          echo "$KEYSTORE_BASE64" | base64 --decode > keystore.jks
-          # 2. 验证签名文件解码是否成功
-          if [ ! -f keystore.jks ]; then
-            echo "❌ 签名文件解码失败，请检查KEYSTORE_BASE64是否正确"
-            exit 1
-          fi
-          # 3. 生成适配项目的签名配置文件，完全匹配项目自带的signing.properties格式
-          echo "storeFile=../keystore.jks" > app/signing.properties
-          echo "storePassword=$KEYSTORE_PASSWORD" >> app/signing.properties
-          echo "keyAlias=$KEY_ALIAS" >> app/signing.properties
-          echo "keyPassword=$KEY_PASSWORD" >> app/signing.properties
-          echo "✅ 签名配置生成完成"
-
-      # 步骤6：执行Gradle构建，清理旧产物+构建Release版本APK
+      # 步骤6：执行构建，清理旧产物+构建Release版本APK
       - name: 构建Release APK
         run: ./gradlew clean assembleRelease --stacktrace --no-daemon
 

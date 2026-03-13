@@ -1,12 +1,12 @@
 name: 构建SRPatch-X APK
 on:
-  # 推送代码到main/master分支自动构建
+  # 推送代码到main/master分支自动触发构建
   push:
     branches: [ "main", "master" ]
-  # 提交PR到main/master分支自动构建
+  # 提交PR到main/master分支自动触发构建
   pull_request:
     branches: [ "main", "master" ]
-  # 支持手动触发构建（Actions页面可直接运行）
+  # 支持手动在Actions页面点击触发构建
   workflow_dispatch:
   # 发布Release时自动构建并上传APK到Release资产
   release:
@@ -19,7 +19,7 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      # 步骤1：拉取项目代码
+      # 步骤1：拉取项目源码
       - name: 检出项目代码
         uses: actions/checkout@v4
 
@@ -35,32 +35,45 @@ jobs:
       - name: 配置Android SDK环境
         uses: android-actions/setup-android@v3
 
-      # 步骤4：给gradlew脚本添加执行权限，解决Linux环境权限问题
+      # 步骤4：给gradlew脚本添加执行权限，解决Linux环境权限不足问题
       - name: 添加Gradle执行权限
         run: chmod +x ./gradlew
 
-      # 步骤5：配置APK签名（仅当配置了签名Secrets时执行，无配置自动跳过）
+      # 步骤5：APK签名配置（自动判断是否配置签名密钥，无配置自动跳过，绝不报错）
       - name: 准备APK签名配置
-        if: secrets.KEYSTORE_BASE64 != '' && secrets.KEYSTORE_BASE64 != null
         env:
+          # 签名密钥全部通过环境变量传递，兼容有无配置两种场景
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
-          # 解码base64签名文件到项目根目录
+          # 核心逻辑：Shell判断是否配置了签名密钥，无配置直接跳过，有配置才执行签名文件生成
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "⚠️ 未配置签名Secrets，跳过APK签名配置，将构建未签名APK"
+            exit 0
+          fi
+
+          echo "✅ 检测到签名配置，开始生成签名文件与配置"
+          # 1. 将base64编码的签名文件解码为jks格式，放在项目根目录
           echo "$KEYSTORE_BASE64" | base64 --decode > keystore.jks
-          # 生成适配项目的签名配置文件，匹配项目自带的signing.properties格式
+          # 2. 验证签名文件解码是否成功
+          if [ ! -f keystore.jks ]; then
+            echo "❌ 签名文件解码失败，请检查KEYSTORE_BASE64是否正确"
+            exit 1
+          fi
+          # 3. 生成适配项目的签名配置文件，完全匹配项目自带的signing.properties格式
           echo "storeFile=../keystore.jks" > app/signing.properties
           echo "storePassword=$KEYSTORE_PASSWORD" >> app/signing.properties
           echo "keyAlias=$KEY_ALIAS" >> app/signing.properties
           echo "keyPassword=$KEY_PASSWORD" >> app/signing.properties
+          echo "✅ 签名配置生成完成"
 
-      # 步骤6：执行构建，清理旧产物+构建Release版本APK
+      # 步骤6：执行Gradle构建，清理旧产物+构建Release版本APK
       - name: 构建Release APK
         run: ./gradlew clean assembleRelease --stacktrace --no-daemon
 
-      # 步骤7：上传构建产物到Actions页面，可直接下载
+      # 步骤7：上传构建好的APK到Actions产物页，可直接下载
       - name: 上传APK构建产物
         uses: actions/upload-artifact@v4
         with:
@@ -68,10 +81,10 @@ jobs:
           path: app/build/outputs/apk/release/*.apk
           retention-days: 90
 
-      # 步骤8：发布Release时，自动上传APK到Release资产页
+      # 步骤8：发布Release时，自动将APK上传到Release资产页
       - name: 上传APK到GitHub Release
         uses: softprops/action-gh-release@v2
-        if: github.event_name == 'release' && github.event.action == 'published'
+        if: ${{ github.event_name == 'release' && github.event.action == 'published' }}
         with:
           files: app/build/outputs/apk/release/*.apk
           fail_on_unmatched_files: true
